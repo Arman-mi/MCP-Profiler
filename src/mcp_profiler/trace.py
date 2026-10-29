@@ -21,6 +21,7 @@ Then one record per observed message, in the field order of MESSAGE_FIELDS:
   is_error   responses only: whether it carries a JSON-RPC `error`
   bytes      raw line length, newline included
   tool_name  params.name of a tools/call request
+  ref_id     params.requestId of a notifications/cancelled: the request it cancels
   proxy_ns   monotonic time from reading the message to having forwarded it
 
 With capture_payloads, records also carry "payload" (params, result or error as
@@ -58,7 +59,7 @@ CLOSE_TIMEOUT_S = 10.0
 
 MESSAGE_FIELDS = (
     "run_id", "server", "seq", "t_mono_ns", "direction", "kind", "rpc_id",
-    "method", "is_error", "bytes", "tool_name", "proxy_ns",
+    "method", "is_error", "bytes", "tool_name", "ref_id", "proxy_ns",
 )  # fmt: skip
 
 
@@ -204,11 +205,15 @@ class TraceWriter:
         else:
             kind, rpc_id, method, is_error = info
 
-        tool_name = None
+        tool_name = ref_id = None
         if method == "tools/call" and kind == "request":
             params = msg.get("params")
             if isinstance(params, dict) and isinstance(params.get("name"), str):
                 tool_name = params["name"]
+        elif method == "notifications/cancelled":
+            params = msg.get("params")
+            if isinstance(params, dict) and _valid_id(params.get("requestId")):
+                ref_id = params["requestId"]
 
         rec = {
             "run_id": self.run_id,
@@ -222,6 +227,7 @@ class TraceWriter:
             "is_error": is_error,
             "bytes": len(line),
             "tool_name": tool_name,
+            "ref_id": ref_id,
             "proxy_ns": proxy_ns,
         }
         if self.capture_payloads:

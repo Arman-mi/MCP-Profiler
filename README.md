@@ -7,8 +7,8 @@ analyze offline to see where wall-clock time goes in an agent run.
 The proxy forwards original bytes unchanged and has no runtime dependencies
 (Python 3.11+ stdlib only).
 
-> **Status:** stage 2. The proxy records a trace of every message. The offline
-> analysis CLI is not written yet.
+> **Status:** stage 3. The proxy records a trace of every message, and
+> `mcp-profiler analyze` turns traces into a report.
 
 ## Install
 
@@ -87,6 +87,7 @@ message seen in either direction:
 | `is_error` | Responses only: the response carries a JSON-RPC `error`. A tool result with `isError: true` is a successful response |
 | `bytes` | Raw line length including the newline |
 | `tool_name` | `params.name` of a `tools/call` request |
+| `ref_id` | `params.requestId` of a `notifications/cancelled`: the request it cancels |
 | `proxy_ns` | Time from reading the message to having written it on. This is the proxy's in-process cost only (see below) |
 
 Records are written by a background thread every 100 ms and on exit, including
@@ -100,6 +101,47 @@ a 16 MiB one. Also invisible from inside the proxy: the extra pipe hop and the
 event-loop wakeup. On a WSL2 dev box, a ping round trip took ~75 µs direct and
 ~290 µs through the proxy, with tracing on or off. That is ~105 µs per message,
 against a `proxy_ns` median of ~40 µs.
+
+## Analyze
+
+```sh
+mcp-profiler analyze [--json] [--min-chain N] <trace.jsonl> [more.jsonl...]
+```
+
+Reads one or more traces, merges them by monotonic time, and pairs each request
+with its response. Requests are keyed by run, direction and id, and duplicate open
+ids are matched earliest first. Each pair becomes a span with a status:
+
+- `ok` or `error`: a response arrived.
+- `cancelled`: closed by a `notifications/cancelled`. A response that arrives
+  anyway is attached to the span as a late response.
+- `orphaned`: still open when its run's trace ends.
+
+The report has five sections:
+
+1. **Wall clock.** Total time, time with at least one request in flight, idle
+   time, client gaps, and the share of time spent waiting on each server. A client
+   gap runs from a response being forwarded to the client until that client's next
+   request. With nothing else in flight, it approximates agent or LLM think time.
+2. **Per tool.** Count, p50/p95/max duration over completed calls, and the error
+   rate. Errors are JSON-RPC errors only; a tool result with `isError: true` is
+   not recorded in the trace.
+3. **Concurrency.** Time spent at each in-flight level, the maximum concurrency,
+   and how many tool calls were issued while another request was in flight. This
+   shows whether the client parallelizes at all.
+4. **Sequential chains.** Runs of tool calls where each was issued only after the
+   previous response, with nothing else in flight. Each chain shows its total
+   client-gap time and how much time it would save if its calls were independent
+   and issued together. That saving is an upper bound: a call may depend on the
+   previous result.
+5. **Instrument overhead.** Total `proxy_ns` as a fraction of wall clock. This
+   understates the proxy's real cost; see "What `proxy_ns` does not include" above.
+
+Wall clock counts only time when at least one run is alive (from its first to its
+last record). Unrelated sessions in one file therefore don't add their dead time
+in between as idle, and their calls never chain together. Runs from different
+boots or machines can't be aligned and produce a warning. `--json` also includes
+every span and gap.
 
 ## Development
 

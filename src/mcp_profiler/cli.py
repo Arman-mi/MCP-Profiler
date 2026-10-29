@@ -1,4 +1,6 @@
-"""Entry point: mcp-profiler [options] -- <command> [args...]
+"""Entry points:
+  mcp-profiler [options] -- <command> [args...]     run the proxy
+  mcp-profiler analyze [options] <trace.jsonl>...   offline analysis (see analyze.py)
 
 stdout is the MCP protocol channel once the proxy runs, so every diagnostic
 in this module goes to stderr.
@@ -12,9 +14,9 @@ import os
 import signal
 import sys
 
-from mcp_profiler import __version__, proxy, trace
+from mcp_profiler import __version__, analyze, proxy, trace
 
-USAGE = "mcp-profiler [options] -- <command> [args...]"
+USAGE = "mcp-profiler [options] -- <command> [args...]  |  mcp-profiler analyze <trace.jsonl>..."
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +69,9 @@ def split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
 def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
+    if argv[:1] == ["analyze"]:
+        # A server named "analyze" still works: `mcp-profiler -- analyze`.
+        return analyze.main(argv[1:])
     own_args, server_cmd = split_argv(argv)
 
     parser = build_parser()

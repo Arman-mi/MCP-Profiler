@@ -81,6 +81,7 @@ def test_writer_record_schema_and_parse_errors(tmp_path):
         b"\xff\xfe\n",  # invalid UTF-8
         b"[" * 100_000 + b"\n",  # nesting deep enough to hit RecursionError
         b"\n",
+        b'{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7,"reason":"x"}}\n',
     ]
     for i, line in enumerate(lines):
         w.record("c2s", line, w.next_seq(), 1000 + i, 5)
@@ -88,8 +89,10 @@ def test_writer_record_schema_and_parse_errors(tmp_path):
     header, records = read_trace(tmp_path / "t.jsonl")
     assert header["kind"] == "header" and header["version"] == __version__
     assert all(tuple(r) == MESSAGE_FIELDS for r in records)  # field order, no payload keys
-    req, resp, *errors = records
+    req, resp, *errors, cancel = records
     assert (req["kind"], req["rpc_id"], req["method"], req["tool_name"]) == ("request", 7, "tools/call", "echo")
+    assert (cancel["kind"], cancel["rpc_id"], cancel["ref_id"]) == ("notification", None, 7)
+    assert req["ref_id"] is None
     assert (resp["kind"], resp["is_error"], resp["method"]) == ("response", False, None)
     assert [r["kind"] for r in errors] == ["parse_error"] * 4
     assert [r["bytes"] for r in records] == [len(line) for line in lines]
