@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+traces/
+*.trace.jsonl
+
+# Claude Code: local settings and session notes
+.claude/
+CLAUDE.md
+sessions.md
