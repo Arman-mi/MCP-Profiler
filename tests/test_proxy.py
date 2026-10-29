@@ -13,8 +13,8 @@ from mcp_profiler.proxy import LINE_LIMIT
 PROXY = [sys.executable, "-m", "mcp_profiler.cli"]
 
 
-def run_proxy(server, stdin_bytes=b"", log=None, timeout=30):
-    argv = [*PROXY, *(["--log", str(log)] if log else []), "--", *server]
+def run_proxy(server, stdin_bytes=b"", log=None, timeout=30, trace=os.devnull):
+    argv = [*PROXY, *(["--log", str(log)] if log else []), "--trace", str(trace), "--", *server]
     return subprocess.run(argv, input=stdin_bytes, capture_output=True, timeout=timeout)
 
 
@@ -76,11 +76,11 @@ def test_missing_command_exits_127(tmp_path):
     assert "failed to start" in log.read_text()
 
 
-def _start_proxy_with_idle_client(server, log, ready="started pid"):
+def _start_proxy_with_idle_client(server, log, ready="started pid", trace=os.devnull):
     """Start the proxy with a stdin pipe we keep open, like an idle client."""
     r, w = os.pipe()
     proc = subprocess.Popen(
-        [*PROXY, "--log", str(log), "--", *server],
+        [*PROXY, "--log", str(log), "--trace", str(trace), "--", *server],
         stdin=r,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

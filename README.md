@@ -7,7 +7,8 @@ analyze offline to see where wall-clock time goes in an agent run.
 The proxy forwards original bytes unchanged and has no runtime dependencies
 (Python 3.11+ stdlib only).
 
-> **Status:** stage 1, a pure passthrough proxy. No traces are recorded yet.
+> **Status:** stage 2. The proxy records a trace of every message. The offline
+> analysis CLI is not written yet.
 
 ## Install
 
@@ -25,7 +26,7 @@ Put `mcp-profiler` in front of the server command your MCP client would normally
 launch, separated by `--`:
 
 ```sh
-mcp-profiler [--log FILE] -- <command> [args...]
+mcp-profiler [options] -- <command> [args...]
 ```
 
 Example MCP client config:
@@ -35,7 +36,7 @@ Example MCP client config:
   "mcpServers": {
     "filesystem": {
       "command": "mcp-profiler",
-      "args": ["--log", "/tmp/fs-proxy.log", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+      "args": ["--log", "/tmp/fs-proxy.log", "--trace", "/tmp/fs.jsonl", "--", "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
     }
   }
 }
@@ -46,6 +47,10 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `--log FILE` | Append the server's stderr (tagged `[server]`) and proxy diagnostics (tagged `[mcp-profiler]`) here instead of stderr |
+| `--trace FILE` | Append trace records here. Default: `./traces/<run_id>.jsonl`, relative to the proxy's working directory. MCP clients often launch servers from `/`, so set this in client configs |
+| `--name NAME` | Server name recorded in the trace. Default: basename of the command |
+| `--capture-payloads` | Also record each message's `params`/`result`/`error` as JSON text, truncated. Off by default: payloads can contain user data and bloat traces |
+| `--payload-cap BYTES` | Truncation limit for captured payloads (default 2048) |
 | `--version` | Show version and exit |
 
 The proxy never writes anything but forwarded protocol bytes to stdout.
@@ -60,6 +65,41 @@ Behavior:
 - The server runs in its own process group. SIGINT/SIGTERM sent to the proxy are
   forwarded to that group once. If the server is still alive 2 s later, or a
   second signal arrives, the group is SIGKILLed.
+
+## Trace format
+
+Newline-delimited JSON. Each run starts with a header, followed by one record per
+message seen in either direction:
+
+```json
+{"kind":"header","run_id":"8a60…","server":"echo-server","version":"0.1.0","argv":[…],"command":["python","fixtures/echo_server.py"],"pid":15183,"t_wall_ns":1793240551067511557,"t_wall_iso":"2026-10-29T02:22:31.067512+00:00","t_mono_ns":3767725890065,"capture_payloads":false,"payload_cap":2048}
+{"run_id":"8a60…","server":"echo-server","seq":5,"t_mono_ns":3768608409076,"direction":"c2s","kind":"request","rpc_id":3,"method":"tools/call","is_error":null,"bytes":92,"tool_name":"fast_tool","proxy_ns":56994}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `seq` | Per-run counter over both directions, taken when the message is read. Sort by it: file order can differ slightly |
+| `t_mono_ns` | `time.monotonic_ns()` when the message's last byte was read. Wall clock = `header.t_wall_ns + (t_mono_ns - header.t_mono_ns)` |
+| `direction` | `c2s` (client to server) or `s2c` |
+| `kind` | `request`, `response`, `notification`, or `parse_error` (not valid JSON or not a JSON-RPC 2.0 message; forwarded anyway) |
+| `rpc_id` | Message id. Ids are unique per direction only: match a `c2s` request with an `s2c` response |
+| `method` | Requests and notifications only |
+| `is_error` | Responses only: the response carries a JSON-RPC `error`. A tool result with `isError: true` is a successful response |
+| `bytes` | Raw line length including the newline |
+| `tool_name` | `params.name` of a `tools/call` request |
+| `proxy_ns` | Time from reading the message to having written it on. This is the proxy's in-process cost only (see below) |
+
+Records are written by a background thread every 100 ms and on exit, including
+on SIGINT/SIGTERM and when the server dies. A trace file can hold several runs:
+each record carries its `run_id`.
+
+**What `proxy_ns` does not include.** Messages are parsed and recorded *after*
+they are forwarded, so parsing never delays the message itself. It can still
+delay the next message: recording takes ~8 µs for a typical message and ~30 ms for
+a 16 MiB one. Also invisible from inside the proxy: the extra pipe hop and the
+event-loop wakeup. On a WSL2 dev box, a ping round trip took ~75 µs direct and
+~290 µs through the proxy, with tracing on or off. That is ~105 µs per message,
+against a `proxy_ns` median of ~40 µs.
 
 ## Development
 
@@ -79,7 +119,7 @@ python fixtures/echo_server.py [--blocking]
 python fixtures/driver.py [--concurrent] [--calls fast slow:0.5 echo:hi ...] -- <server command...>
 
 # The same run through the proxy.
-python fixtures/driver.py -- mcp-profiler --log /tmp/p.log -- python fixtures/echo_server.py
+python fixtures/driver.py -- mcp-profiler --log /tmp/p.log --trace /tmp/t.jsonl -- python fixtures/echo_server.py
 ```
 
 See `CLAUDE.md` for the invariants the proxy must respect.

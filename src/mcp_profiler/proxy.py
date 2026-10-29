@@ -1,12 +1,13 @@
 """Transparent stdio proxy between an MCP client and a child MCP server.
 
-Stage 1: pure passthrough. Three concurrent pumps:
-  our stdin    -> child stdin
-  child stdout -> our stdout
+Three concurrent pumps:
+  our stdin    -> child stdin   (traced as c2s)
+  child stdout -> our stdout    (traced as s2c)
   child stderr -> log (tagged, via a writer thread so the event loop never blocks)
 
 Bytes are forwarded exactly as read, one line at a time, and every write is
-drained to the kernel before the next read. Nothing here writes to stdout
+drained to the kernel before the next read. Each line is recorded only after it
+has been forwarded, so parsing never delays it. Nothing here writes to stdout
 except the stdout pump (see CLAUDE.md).
 """
 
@@ -20,8 +21,11 @@ import signal
 import stat
 import sys
 import threading
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
+
+from mcp_profiler.trace import TraceWriter
 
 # Lines up to this size are forwarded as one write. Longer lines are not an
 # error: they are forwarded in chunks of about this size as they arrive.
@@ -149,11 +153,37 @@ async def _read_chunk(reader: asyncio.StreamReader) -> tuple[bytes, bool]:
         return await reader.readexactly(max(e.consumed, 1)), False
 
 
-async def _pump(reader: asyncio.StreamReader, write: Callable[[bytes], Awaitable[None]]) -> None:
+async def _pump(
+    reader: asyncio.StreamReader,
+    write: Callable[[bytes], Awaitable[None]],
+    trace: TraceWriter | None,
+    direction: str,
+) -> None:
+    """Forward chunks as they arrive; record one trace event per complete line.
+
+    An over-long line is forwarded piece by piece. Its pieces are also kept, so
+    the trace can parse it whole once its final piece has been forwarded; its
+    timestamp is that of the final piece and its proxy_ns the sum over pieces.
+    """
+    pieces: list[bytes] = []
+    proxy_ns = 0
     while True:
         chunk, eof = await _read_chunk(reader)
+        t_read = time.monotonic_ns()
+        complete = chunk.endswith(b"\n") or (eof and bool(chunk or pieces))
+        if trace is not None and complete:
+            seq = trace.next_seq()  # taken with t_read, so seq order is time order
         if chunk:
             await write(chunk)
+            proxy_ns += time.monotonic_ns() - t_read
+        if trace is not None:
+            if complete:
+                line = b"".join((*pieces, chunk)) if pieces else chunk
+                pieces.clear()
+                trace.record(direction, line, seq, t_read, proxy_ns)
+                proxy_ns = 0
+            elif chunk:
+                pieces.append(chunk)
         if eof:
             return
 
@@ -162,21 +192,36 @@ def _exit_status(returncode: int) -> int:
     return 128 - returncode if returncode < 0 else returncode
 
 
-async def run(command: list[str], log_path: str | None = None) -> int:
+async def run(command: list[str], log_path: str | None = None, trace: TraceWriter | None = None) -> int:
     """Run `command` behind the proxy. Returns the child's raw returncode
-    (negative for death by signal), or 126/127 if it could not be started."""
+    (negative for death by signal), or 126/127 if it could not be started.
+    `trace` is flushed and closed before returning, however the run ends."""
     log = LogSink(log_path)
     saved_blocking = {fd: os.get_blocking(fd) for fd in (0, 1)}
+    if trace is not None:
+        log.diag(f"tracing to {trace.path} (run {trace.run_id})")
     try:
-        return await _run(command, log)
+        return await _run(command, log, trace)
     finally:
         for fd, blocking in saved_blocking.items():
             with suppress(OSError):
                 os.set_blocking(fd, blocking)
+        if trace is not None:
+            _close_trace(trace, log)
         log.close()
 
 
-async def _run(command: list[str], log: LogSink) -> int:
+def _close_trace(trace: TraceWriter, log: LogSink) -> None:
+    if not trace.close():
+        log.diag(f"trace: writer did not finish flushing {trace.path}; records may be missing")
+    if trace.record_errors:
+        log.diag(f"trace: {trace.record_errors} messages could not be recorded, first: {trace.first_error!r}")
+    if trace.write_errors:
+        log.diag(f"trace: {trace.write_errors} failed writes to {trace.path}, first: {trace.first_error!r}")
+    log.diag(f"trace: {trace.records} messages recorded to {trace.path}")
+
+
+async def _run(command: list[str], log: LogSink, trace: TraceWriter | None) -> int:
     loop = asyncio.get_running_loop()
     proc: asyncio.subprocess.Process | None = None
     early_signal: signal.Signals | None = None
@@ -232,14 +277,19 @@ async def _run(command: list[str], log: LogSink) -> int:
         log.diag(f"started pid {proc.pid}: {command!r}")
         if early_signal is not None:
             on_signal(early_signal)
-        return await _serve(proc, log, loop)
+        return await _serve(proc, log, loop, trace)
     finally:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(sig)
         kill_child("proxy shutting down with server still running")
 
 
-async def _serve(proc: asyncio.subprocess.Process, log: LogSink, loop: asyncio.AbstractEventLoop) -> int:
+async def _serve(
+    proc: asyncio.subprocess.Process,
+    log: LogSink,
+    loop: asyncio.AbstractEventLoop,
+    trace: TraceWriter | None,
+) -> int:
     """Pump traffic until the child exits; return its returncode."""
     assert proc.stdin and proc.stdout and proc.stderr
     child_in = proc.stdin
@@ -272,7 +322,7 @@ async def _serve(proc: asyncio.subprocess.Process, log: LogSink, loop: asyncio.A
 
     async def upstream_pump() -> None:
         try:
-            await _pump(client_in, to_child)
+            await _pump(client_in, to_child, trace, "c2s")
             log.diag("client stdin EOF; closing server stdin")
         except (BrokenPipeError, ConnectionResetError):
             log.diag("server stdin closed; no longer forwarding client input")
@@ -298,7 +348,7 @@ async def _serve(proc: asyncio.subprocess.Process, log: LogSink, loop: asyncio.A
         tasks.append(errstream)
         client_in = await _open_stdin(loop)
         upstream = asyncio.create_task(upstream_pump(), name="stdin->child")
-        downstream = asyncio.create_task(_pump(child_out, to_client), name="child->stdout")
+        downstream = asyncio.create_task(_pump(child_out, to_client, trace, "s2c"), name="child->stdout")
         tasks += [upstream, downstream]
 
         returncode = await proc.wait()

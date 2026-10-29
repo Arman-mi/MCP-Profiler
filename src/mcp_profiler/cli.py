@@ -1,4 +1,4 @@
-"""Entry point: mcp-profiler [--log FILE] -- <command> [args...]
+"""Entry point: mcp-profiler [options] -- <command> [args...]
 
 stdout is the MCP protocol channel once the proxy runs, so every diagnostic
 in this module goes to stderr.
@@ -12,9 +12,9 @@ import os
 import signal
 import sys
 
-from mcp_profiler import __version__, proxy
+from mcp_profiler import __version__, proxy, trace
 
-USAGE = "mcp-profiler [--log FILE] -- <command> [args...]"
+USAGE = "mcp-profiler [options] -- <command> [args...]"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -22,14 +22,35 @@ def build_parser() -> argparse.ArgumentParser:
         prog="mcp-profiler",
         usage=USAGE,
         description=(
-            "Transparent stdio MCP proxy. Launches the command as a child process "
-            "and forwards its stdin/stdout unchanged."
+            "Transparent stdio MCP proxy. Launches the command as a child process, "
+            "forwards its stdin/stdout unchanged, and records a trace of every message."
         ),
     )
     parser.add_argument(
         "--log",
         metavar="FILE",
         help="append the server's stderr and proxy diagnostics here (default: stderr)",
+    )
+    parser.add_argument(
+        "--trace",
+        metavar="FILE",
+        help=f"append trace records here (default: ./{trace.DEFAULT_DIR}/<run_id>.jsonl)",
+    )
+    parser.add_argument(
+        "--name",
+        help="server name recorded in the trace (default: basename of the command)",
+    )
+    parser.add_argument(
+        "--capture-payloads",
+        action="store_true",
+        help="also record params/result/error, truncated; may contain user data",
+    )
+    parser.add_argument(
+        "--payload-cap",
+        type=int,
+        default=trace.DEFAULT_PAYLOAD_CAP,
+        metavar="BYTES",
+        help="truncate captured payloads to this many bytes (default: %(default)s)",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
@@ -53,8 +74,26 @@ def main(argv: list[str] | None = None) -> int:
 
     if not server_cmd:
         parser.error("missing server command; usage: " + USAGE)
+    if args.payload_cap < 0:
+        parser.error("--payload-cap must be >= 0")
 
-    returncode = asyncio.run(proxy.run(server_cmd, args.log))
+    run_id = trace.new_run_id()
+    trace_path = args.trace or trace.default_path(run_id)
+    try:
+        # Opened before the server starts: a bad trace path fails fast, here.
+        writer = trace.TraceWriter(
+            trace_path,
+            run_id=run_id,
+            server=args.name or os.path.basename(server_cmd[0]),
+            argv=[sys.argv[0], *argv],
+            command=server_cmd,
+            capture_payloads=args.capture_payloads,
+            payload_cap=args.payload_cap,
+        )
+    except OSError as e:
+        parser.exit(2, f"mcp-profiler: cannot open trace file {trace_path!r}: {e}\n")
+
+    returncode = asyncio.run(proxy.run(server_cmd, args.log, writer))
 
     if returncode < 0:
         # The server died from a signal: die from the same one, so our parent

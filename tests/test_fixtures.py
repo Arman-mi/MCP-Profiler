@@ -1,5 +1,6 @@
 """The MCP fixtures work directly and behave identically behind the proxy."""
 
+import os
 import re
 import subprocess
 import sys
@@ -15,8 +16,8 @@ PROXY = [sys.executable, "-m", "mcp_profiler.cli"]
 TIMING = re.compile(r"\s+[\d.]+ ms")
 
 
-def drive(*driver_args, server=SERVER, via_proxy=None):
-    prefix = [*PROXY, "--log", str(via_proxy), "--"] if via_proxy else []
+def drive(*driver_args, server=SERVER, via_proxy=None, trace=os.devnull):
+    prefix = [*PROXY, "--log", str(via_proxy), "--trace", str(trace), "--"] if via_proxy else []
     return subprocess.run(
         [*DRIVER, *driver_args, "--", *prefix, *server],
         capture_output=True,
